@@ -240,7 +240,7 @@
         },
         {
           "check": "sep-2243-server-not-expect-null",
-          "status": "untested",
+          "status": "tested",
           "text": "Parameter value is null or omitted: Server MUST NOT expect the header."
         },
         {
@@ -289,8 +289,8 @@
         "sep-2243-server-no-xmcp-tool"
       ],
       "summary": {
-        "tested": 18,
-        "untested": 2,
+        "tested": 19,
+        "untested": 1,
         "excluded": 4,
         "untracked": 3,
         "unkeyed": 0

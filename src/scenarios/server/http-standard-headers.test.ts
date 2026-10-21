@@ -46,6 +46,45 @@ function mockFetchTarget(
 const findAll = (checks: ConformanceCheck[], id: string) =>
   checks.filter((c) => c.id === id);
 
+// The SEP-2243 server scenarios send their live cases over raw node http
+// (not fetch), so they are driven against a real local server rather than a
+// fetch mock.
+async function startBareServer(
+  handler: (
+    body: any,
+    headers: Record<string, string | string[] | undefined>
+  ) => { status: number; body: object }
+): Promise<{ url: string; close: () => Promise<void> }> {
+  const http = await import('http');
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.setEncoding('utf8');
+    req.on('data', (c) => (raw += c));
+    req.on('end', () => {
+      let body: any = {};
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        // Treat unparseable bodies as empty requests.
+      }
+      const out = handler(body, req.headers);
+      res.writeHead(out.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(out.body));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  return {
+    url: `http://localhost:${port}/mcp`,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      })
+  };
+}
+
 describe('http-custom-header-server-validation — missing fixture policy', () => {
   test('emits untestable FAILUREs for every declared check when no x-mcp-header tool exists', async () => {
     const mockUrl = mockFetchTarget((reqBody) => {
@@ -135,41 +174,6 @@ describe('http-custom-header-server-validation — missing fixture policy', () =
 });
 
 describe('http-header-validation — zero-tools Mcp-Name cases', () => {
-  // This scenario sends its live cases over raw node http (not fetch), so it
-  // is driven against a real local server rather than a fetch mock.
-  async function startBareServer(
-    handler: (body: any) => { status: number; body: object }
-  ): Promise<{ url: string; close: () => Promise<void> }> {
-    const http = await import('http');
-    const server = http.createServer((req, res) => {
-      let raw = '';
-      req.setEncoding('utf8');
-      req.on('data', (c) => (raw += c));
-      req.on('end', () => {
-        let body: any = {};
-        try {
-          body = JSON.parse(raw);
-        } catch {
-          // Treat unparseable bodies as empty requests.
-        }
-        const out = handler(body);
-        res.writeHead(out.status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(out.body));
-      });
-    });
-    await new Promise<void>((resolve) => server.listen(0, resolve));
-    const address = server.address();
-    const port = typeof address === 'object' && address ? address.port : 0;
-    return {
-      url: `http://localhost:${port}/mcp`,
-      close: () =>
-        new Promise<void>((resolve) => {
-          server.closeAllConnections?.();
-          server.close(() => resolve());
-        })
-    };
-  }
-
   test('emits untestable FAILUREs for the Mcp-Name cases when the server lists no tools', async () => {
     const srv = await startBareServer((body) => {
       if (body.method === 'tools/list') {
@@ -251,5 +255,93 @@ describe('http-header-validation — zero-tools Mcp-Name cases', () => {
     )[0];
     expect(whitespace?.status).toBe('FAILURE');
     expect(whitespace?.errorMessage).toContain('Not testable:');
+  });
+});
+
+describe('http-custom-header-server-validation — null or absent parameter', () => {
+  const TOOL = {
+    name: 'route_tool',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        region: { type: 'string', 'x-mcp-header': 'Region' }
+      }
+    }
+  };
+
+  // Serves one x-mcp-header tool. When `requireHeader` is set the server
+  // rejects every tools/call lacking Mcp-Param-Region with -32020, which is
+  // the defect the check exists to catch.
+  function customHeaderServer(requireHeader: boolean) {
+    return startBareServer((body, headers) => {
+      if (body.method === 'tools/list') {
+        return {
+          status: 200,
+          body: {
+            jsonrpc: '2.0',
+            id: body.id,
+            result: {
+              resultType: 'complete',
+              ttlMs: 0,
+              cacheScope: 'private',
+              tools: [TOOL]
+            }
+          }
+        };
+      }
+      const header = headers['mcp-param-region'];
+      const value = body.params?.arguments?.region;
+      const missingButExpected =
+        header === undefined &&
+        (requireHeader || (value !== undefined && value !== null));
+      if (missingButExpected) {
+        return {
+          status: 400,
+          body: {
+            jsonrpc: '2.0',
+            id: body.id ?? null,
+            error: { code: -32020, message: 'Header mismatch' }
+          }
+        };
+      }
+      return {
+        status: 200,
+        body: {
+          jsonrpc: '2.0',
+          id: body.id,
+          result: { content: [{ type: 'text', text: 'ok' }] }
+        }
+      };
+    });
+  }
+
+  async function runAgainst(requireHeader: boolean) {
+    const srv = await customHeaderServer(requireHeader);
+    try {
+      const checks = await new HttpCustomHeaderServerValidationScenario().run(
+        testContext(srv.url)
+      );
+      return findAll(checks, 'sep-2243-server-not-expect-null');
+    } finally {
+      await srv.close();
+    }
+  }
+
+  test('passes a server that accepts null and absent parameters without the header', async () => {
+    const rows = await runAgainst(false);
+    expect(rows.map((c) => c.name).sort()).toEqual([
+      'ServerAcceptsAbsentParamWithoutHeader',
+      'ServerAcceptsNullParamWithoutHeader'
+    ]);
+    for (const row of rows) expect(row.status, row.name).toBe('SUCCESS');
+  });
+
+  test('fails a server that rejects a null or absent parameter for a missing header', async () => {
+    const rows = await runAgainst(true);
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.status, row.name).toBe('FAILURE');
+      expect(row.errorMessage, row.name).toContain('-32020');
+    }
   });
 });

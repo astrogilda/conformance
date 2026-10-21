@@ -84,7 +84,8 @@ export const CUSTOM_HEADER_SERVER_DECLARED_CHECK_IDS = [
   'sep-2243-server-decode-base64',
   'sep-2243-server-validate-param-match',
   'sep-2243-server-reject-invalid-param-chars',
-  'sep-2243-server-reject-param-mismatch'
+  'sep-2243-server-reject-param-mismatch',
+  'sep-2243-server-not-expect-null'
 ] as const;
 
 /**
@@ -613,7 +614,8 @@ export class HttpCustomHeaderServerValidationScenario implements ClientScenario 
 - Server MUST validate Base64-encoded header values
 - Server MUST reject requests with invalid Base64 padding or characters
 - Server MUST treat values without =?base64?...?= wrapper as literal
-- Server MUST reject requests where custom header is omitted but value is in body`;
+- Server MUST reject requests where custom header is omitted but value is in body
+- Server MUST NOT expect the custom header when the parameter is null or not in arguments`;
 
   async run(ctx: RunContext): Promise<ConformanceCheck[]> {
     const { serverUrl } = ctx;
@@ -853,6 +855,33 @@ export class HttpCustomHeaderServerValidationScenario implements ClientScenario 
         defaultArgs,
         defaultHeaders
       );
+
+      // --- Null or Absent Parameter, No Custom Header ---
+
+      await this.testNullOrAbsentCustomHeader(
+        checks,
+        serverUrl,
+        baseHeaders,
+        nextId,
+        xMcpTool.name,
+        paramName,
+        headerSuffix,
+        defaultArgs,
+        defaultHeaders,
+        'null'
+      );
+      await this.testNullOrAbsentCustomHeader(
+        checks,
+        serverUrl,
+        baseHeaders,
+        nextId,
+        xMcpTool.name,
+        paramName,
+        headerSuffix,
+        defaultArgs,
+        defaultHeaders,
+        'absent'
+      );
     } catch (error) {
       checks.push({
         id: 'sep-2243-server-custom-setup',
@@ -1071,6 +1100,92 @@ export class HttpCustomHeaderServerValidationScenario implements ClientScenario 
         name: 'ServerRejectsMissingCustomHeader',
         description:
           'Server MUST reject request where custom header is omitted but value is present in body',
+        status: 'FAILURE',
+        timestamp: new Date().toISOString(),
+        errorMessage: `Failed: ${error instanceof Error ? error.message : String(error)}`,
+        specReferences: [SPEC_REFERENCE_CUSTOM]
+      });
+    }
+  }
+
+  /**
+   * Spec table rows "Parameter value is null" and "Parameter not in
+   * arguments": the client omits the Mcp-Param header and the server MUST NOT
+   * expect it. The server may still reject the call for other reasons (for
+   * example JSON Schema validation of a required or non-nullable parameter),
+   * so the check fails only on a header-validation rejection: JSON-RPC error
+   * -32020 (HeaderMismatch), the code the spec mandates for header failures.
+   */
+  private async testNullOrAbsentCustomHeader(
+    checks: ConformanceCheck[],
+    serverUrl: string,
+    baseHeaders: Record<string, string>,
+    nextId: () => number,
+    toolName: string,
+    paramName: string,
+    headerSuffix: string,
+    defaultArgs: Record<string, any>,
+    defaultHeaders: Record<string, string>,
+    variant: 'null' | 'absent'
+  ): Promise<void> {
+    const checkId = 'sep-2243-server-not-expect-null';
+    const checkName =
+      variant === 'null'
+        ? 'ServerAcceptsNullParamWithoutHeader'
+        : 'ServerAcceptsAbsentParamWithoutHeader';
+    const description =
+      variant === 'null'
+        ? 'Server MUST NOT expect the Mcp-Param header when the parameter value is null'
+        : 'Server MUST NOT expect the Mcp-Param header when the parameter is not in arguments';
+    const args: Record<string, any> = { ...defaultArgs };
+    if (variant === 'null') args[paramName] = null;
+    try {
+      const response = await sendRawRequest(
+        serverUrl,
+        {
+          jsonrpc: '2.0',
+          id: nextId(),
+          method: 'tools/call',
+          params: withRequestMeta({ name: toolName, arguments: args })
+        },
+        {
+          ...baseHeaders,
+          ...defaultHeaders,
+          'Mcp-Method': 'tools/call',
+          'Mcp-Name': toolName
+          // Deliberately omit Mcp-Param-{headerSuffix}, as a conforming
+          // client does for a null or absent value.
+        }
+      );
+      const rpcError =
+        response.body && typeof response.body === 'object'
+          ? response.body.error
+          : undefined;
+      const headerRejected = rpcError?.code === HEADER_MISMATCH_ERROR_CODE;
+      checks.push({
+        id: checkId,
+        name: checkName,
+        description,
+        status: headerRejected ? 'FAILURE' : 'SUCCESS',
+        timestamp: new Date().toISOString(),
+        errorMessage: headerRejected
+          ? `Server rejected the request with HTTP ${response.status} and JSON-RPC error ${HEADER_MISMATCH_ERROR_CODE} although Mcp-Param-${headerSuffix} is correctly omitted for a ${variant} parameter.`
+          : undefined,
+        specReferences: [SPEC_REFERENCE_CUSTOM],
+        details: {
+          toolName,
+          paramName,
+          variant,
+          omittedHeader: `Mcp-Param-${headerSuffix}`,
+          responseStatus: response.status,
+          responseBody: response.body
+        }
+      });
+    } catch (error) {
+      checks.push({
+        id: checkId,
+        name: checkName,
+        description,
         status: 'FAILURE',
         timestamp: new Date().toISOString(),
         errorMessage: `Failed: ${error instanceof Error ? error.message : String(error)}`,
